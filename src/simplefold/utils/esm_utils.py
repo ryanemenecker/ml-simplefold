@@ -9,7 +9,6 @@
 import torch
 import typing as T
 import numpy as np
-from functools import partial
 
 from utils import residue_constants
 
@@ -18,14 +17,31 @@ try:
 except:
     pass
 
-load_fn = torch.hub.load
+def _esm_loader(model_name):
+    """Return a zero-argument loader for a pretrained ESM-2 ``(model, alphabet)`` pair.
+
+    Prefers the installed ``fair-esm`` package (the same functions torch.hub's ``hubconf``
+    re-exports, same weight URLs, same cache directory) so no GitHub checkout of a moving branch
+    is needed at run time; falls back to torch.hub when the package is not installed.
+    """
+
+    def load():
+        try:
+            import esm.pretrained as esm_pretrained
+        except ImportError:
+            return torch.hub.load("facebookresearch/esm:main", model_name)
+        return getattr(esm_pretrained, model_name)()
+
+    return load
+
+
 esm_registry = {
-    "esm2_8M": partial(load_fn, "facebookresearch/esm:main", "esm2_t6_8M_UR50D"),
-    "esm2_35M": partial(load_fn, "facebookresearch/esm:main", "esm2_t12_35M_UR50D"),
-    "esm2_150M": partial(load_fn, "facebookresearch/esm:main", "esm2_t30_150M_UR50D"),
-    "esm2_650M": partial(load_fn, "facebookresearch/esm:main", "esm2_t33_650M_UR50D"),
-    "esm2_3B": partial(load_fn, "facebookresearch/esm:main", "esm2_t36_3B_UR50D"),
-    "esm2_15B": partial(load_fn, "facebookresearch/esm:main", "esm2_t48_15B_UR50D"),
+    "esm2_8M": _esm_loader("esm2_t6_8M_UR50D"),
+    "esm2_35M": _esm_loader("esm2_t12_35M_UR50D"),
+    "esm2_150M": _esm_loader("esm2_t30_150M_UR50D"),
+    "esm2_650M": _esm_loader("esm2_t33_650M_UR50D"),
+    "esm2_3B": _esm_loader("esm2_t36_3B_UR50D"),
+    "esm2_15B": _esm_loader("esm2_t48_15B_UR50D"),
 }
 
 
@@ -198,11 +214,12 @@ def compute_language_model_representations(
     if backend == "mlx":
         esmaa = mx.array(esmaa)
 
-    res = esm(
-        esmaa,
-        repr_layers=range(esm.num_layers + 1),
-        need_head_weights=False,
-    )
+    with torch.no_grad():  # inference only: do not build an autograd graph over the 36-layer ESM
+        res = esm(
+            esmaa,
+            repr_layers=range(esm.num_layers + 1),
+            need_head_weights=False,
+        )
     if backend == "mlx":
         res['representations'] = {k: torch.from_numpy(np.array(v)) for k,v in res['representations'].items()}
 

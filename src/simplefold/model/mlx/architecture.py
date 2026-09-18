@@ -192,33 +192,48 @@ class FoldingDiT(nn.Module):
 
         return atom_attn_mask
 
-    def __call__(self, noised_pos, t, feats, self_cond=None):
+    @staticmethod
+    def _trunk_freqs_cis(trunk, pos):
+        """Axial RoPE table shared by all blocks of a HomogenTrunk (None if the trunk has no RoPE)."""
+        try:
+            pos_embedder = trunk.blocks[0].attn.pos_embedder
+        except (AttributeError, IndexError):
+            return None
+        if pos_embedder is None or not hasattr(pos_embedder, "compute_freqs_cis"):
+            return None
+        return pos_embedder.compute_freqs_cis(pos)
 
+    def precompute_static(self, feats):
+        """Compute everything in __call__() that depends only on ``feats``.
+
+        These arrays are identical on every sampling step of one protein, so the sampler computes
+        them once and hands them back through ``__call__(..., static=...)``. The exact same ops run
+        on the exact same inputs as the inline path, so results are bitwise identical.
+        """
         B, N, _ = feats["ref_pos"].shape
-        M = feats["mol_type"].shape[1]
         atom_to_token = feats["atom_to_token"].astype(mx.float32)
         atom_to_token_idx = feats["atom_to_token_idx"]
         ref_space_uid = feats["ref_space_uid"]
+        static = {"_feats_id": id(feats)}  # guards against reuse with a different feats dict
 
         # create atom attention masks
-        atom_attn_mask_enc = self.create_atom_attn_mask(
+        static["atom_attn_mask_enc"] = self.create_atom_attn_mask(
             feats,
             natoms=N,
             atom_n_queries=self.atom_n_queries_enc,
             atom_n_keys=self.atom_n_keys_enc,
         )
-        atom_attn_mask_dec = self.create_atom_attn_mask(
+        static["atom_attn_mask_dec"] = self.create_atom_attn_mask(
             feats,
             natoms=N,
             atom_n_queries=self.atom_n_queries_dec,
             atom_n_keys=self.atom_n_keys_dec,
         )
 
-        # create condition embeddings for AdaLN
-        c_emb = self.time_embedder(t)  # (B, D)
+        # length condition for AdaLN
         if self.use_length_condition:
             length = feats["max_num_tokens"].astype(mx.float32)[..., None]
-            c_emb = c_emb + self.length_embedder(mx.log(length))
+            static["length_emb"] = self.length_embedder(mx.log(length))
 
         mol_type = feats["mol_type"]
         mol_type = one_hot(mol_type, num_classes=4).astype(mx.float32)  # [B, M, 4]
@@ -244,24 +259,17 @@ class FoldingDiT(nn.Module):
             ],
             axis=-1,
         )  # (B, N, PD1+PD2+427)
-        atom_feat = self.atom_feat_proj(atom_feat)  # (B, N, D)
-
-        atom_coord = self.pos_embedder(pos=noised_pos)  # (B, N, PD1)
-        atom_coord = self.atom_pos_proj(atom_coord)  # (B, N, D)
-
-        atom_in = mx.concatenate([atom_feat, atom_coord], axis=-1)
-        atom_in = self.atom_in_proj(atom_in)  # (B, N, D)
+        static["atom_feat"] = self.atom_feat_proj(atom_feat)  # (B, N, D)
 
         # position embeddings for Axial RoPE
-        atom_pe_pos = mx.concatenate(
+        static["atom_pe_pos"] = mx.concatenate(
             [
                 ref_space_uid[..., None].astype(mx.float32),  # (B, N, 1)
                 feats["ref_pos"],  # (B, N, 3)
             ],
             axis=-1,
         )  # (B, N, 4)
-
-        token_pe_pos = mx.concatenate(
+        static["token_pe_pos"] = mx.concatenate(
             [
                 feats["residue_index"][..., None].astype(mx.float32),  # (B, M, 1)
                 feats["entity_id"][..., None].astype(mx.float32),  # (B, M, 1)
@@ -270,32 +278,65 @@ class FoldingDiT(nn.Module):
             ],
             axis=-1,
         )  # (B, M, 4)
+        # RoPE tables: one per trunk instead of one per block per step
+        static["freqs_cis_enc"] = self._trunk_freqs_cis(self.atom_encoder_transformer, static["atom_pe_pos"])
+        static["freqs_cis_dec"] = self._trunk_freqs_cis(self.atom_decoder_transformer, static["atom_pe_pos"])
+        static["freqs_cis_trunk"] = self._trunk_freqs_cis(self.trunk, static["token_pe_pos"])
+
+        # grouping / ungrouping operators
+        static["atom_to_token"] = atom_to_token
+        atom_to_token_mean = atom_to_token / (
+            atom_to_token.sum(axis=1, keepdims=True) + 1e-6
+        )
+        static["atom_to_token_mean_T"] = atom_to_token_mean.swapaxes(axis1=1, axis2=2)
+
+        # ESM embedding
+        esm_s = (
+            mx.softmax(self.esm_s_combine, axis=0)[None, ...] @ feats["esm_s"]
+        ).squeeze(axis=2)
+        # MLX is only intended for inference, we do not drop any ids
+        static["esm_emb"] = self.esm_s_proj(esm_s, train=False)
+        return static
+
+    def __call__(self, noised_pos, t, feats, self_cond=None, static=None):
+        if static is None:
+            static = self.precompute_static(feats)
+        elif static.get("_feats_id") != id(feats):
+            raise ValueError(
+                "`static` was precomputed for a different `feats` dict; call precompute_static(feats) again."
+            )
+        N = noised_pos.shape[1]
+        M = feats["mol_type"].shape[1]
+        atom_to_token = static["atom_to_token"]
+
+        # create condition embeddings for AdaLN
+        c_emb = self.time_embedder(t)  # (B, D)
+        if self.use_length_condition:
+            c_emb = c_emb + static["length_emb"]
+
+        atom_coord = self.pos_embedder(pos=noised_pos)  # (B, N, PD1)
+        atom_coord = self.atom_pos_proj(atom_coord)  # (B, N, D)
+
+        atom_in = mx.concatenate([static["atom_feat"], atom_coord], axis=-1)
+        atom_in = self.atom_in_proj(atom_in)  # (B, N, D)
 
         atom_c_emb_enc = self.atom_enc_cond_proj(c_emb)
         atom_latent = self.context2atom_proj(atom_in)
         atom_latent = self.atom_encoder_transformer(
             latents=atom_latent,
             c=atom_c_emb_enc,
-            attention_mask=atom_attn_mask_enc,
-            pos=atom_pe_pos,
+            attention_mask=static["atom_attn_mask_enc"],
+            pos=static["atom_pe_pos"],
+            freqs_cis=static["freqs_cis_enc"],
         )
-
 
         atom_latent = self.atom2latent_proj(atom_latent)
 
         # grouping: aggregate atom tokens to residue tokens
-        atom_to_token_mean = atom_to_token / (
-            atom_to_token.sum(axis=1, keepdims=True) + 1e-6
-        )
-        latent = mx.matmul(atom_to_token_mean.swapaxes(axis1=1, axis2=2), atom_latent)
+        latent = mx.matmul(static["atom_to_token_mean_T"], atom_latent)
         assert latent.shape[1] == M
 
-        esm_s = (
-            mx.softmax(self.esm_s_combine, axis=0)[None, ...] @ feats["esm_s"]
-        ).squeeze(axis=2)
-
-        # MLX is only interended for inference, we do not drop any ids
-        esm_emb = self.esm_s_proj(esm_s, train=False)
+        esm_emb = static["esm_emb"]
         assert esm_emb.shape[1] == latent.shape[1]
 
         latent = self.esm_cat_proj(mx.concatenate([latent, esm_emb], axis=-1))
@@ -305,7 +346,8 @@ class FoldingDiT(nn.Module):
             latents=latent,
             c=c_emb,
             attention_mask=None,
-            pos=token_pe_pos,
+            pos=static["token_pe_pos"],
+            freqs_cis=static["freqs_cis_trunk"],
         )
 
         # ungrouping: broadcast residue tokens to atom tokens
@@ -321,8 +363,9 @@ class FoldingDiT(nn.Module):
         output = self.atom_decoder_transformer(
             latents=output,
             c=atom_c_emb_dec,
-            attention_mask=atom_attn_mask_dec,
-            pos=atom_pe_pos,
+            attention_mask=static["atom_attn_mask_dec"],
+            pos=static["atom_pe_pos"],
+            freqs_cis=static["freqs_cis_dec"],
         )
 
         output = self.final_layer(output, c=c_emb)

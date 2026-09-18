@@ -39,6 +39,9 @@ class SelfAttentionLayer(nn.Module):
         # NOTE scale factor was wrong in my original version,
         # can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim**-0.5
+        # Exactly the value the original per-call expression `1.0 / mx.sqrt(q.shape[-1])` produced
+        # (float32 sqrt and division), materialized once here instead of on every attention call.
+        self._sdpa_scale = float(1.0 / mx.sqrt(head_dim))
 
         self.qkv = linear_target(hidden_size, hidden_size * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -103,13 +106,17 @@ class EfficientSelfAttentionLayer(SelfAttentionLayer):
         if attn_mask is not None:
             attn_mask = attn_mask.astype(q.dtype)
 
-        # if self.pos_embedder and pos is not None:
-        q, k = self.pos_embedder(q, k, pos)
+        freqs_cis = kwargs.get("freqs_cis")  # precomputed RoPE table (per-protein constant)
+        if freqs_cis is not None:
+            q, k = self.pos_embedder(q, k, pos, freqs_cis=freqs_cis)
+        else:
+            q, k = self.pos_embedder(q, k, pos)
 
         q, k = self.q_norm(q), self.k_norm(k)
 
+        # scale must be a Python float: a 0-d mx.array here forces a host sync on every call
         x = mx.fast.scaled_dot_product_attention(
-            q, k, v, mask=attn_mask, scale=1.0 / mx.sqrt(q.shape[-1])
+            q, k, v, mask=attn_mask, scale=self._sdpa_scale
         )
 
         x = x.swapaxes(axis1=1, axis2=2).reshape(B, N, C)

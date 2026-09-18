@@ -4,6 +4,26 @@
 #
 
 import mlx.core as mx
+from mlx.utils import tree_flatten, tree_unflatten
+
+
+def load_mlx_state_dict(model, mlx_state_dict):
+    """``model.update`` with the strictness of ``torch.nn.Module.load_state_dict(strict=True)``.
+
+    ``mlx.nn.Module.update`` silently ignores parameters that are absent from the given tree, which
+    would leave them at their random initialization. Raise instead if the checkpoint does not
+    cover the model exactly.
+    """
+    param_keys = {k for k, _ in tree_flatten(model.parameters())}
+    sd_keys = set(mlx_state_dict)
+    missing = sorted(param_keys - sd_keys)
+    unexpected = sorted(sd_keys - param_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "MLX state dict does not match the model: "
+            f"{len(missing)} missing (e.g. {missing[:5]}), {len(unexpected)} unexpected (e.g. {unexpected[:5]})."
+        )
+    model.update(tree_unflatten(list(mlx_state_dict.items())))
 
 
 # We redefine the centering function here using mlx primitives

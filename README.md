@@ -32,11 +32,17 @@ conda create -n simplefold python=3.10
 conda activate simplefold
 python -m pip install -U pip build; pip install -e .
 ```
-If you want to use MLX backend on Apple silicon: 
+If you want to use the MLX backend on Apple silicon, install the `mlx` extra instead (it adds `mlx>=0.32.2`; the ESM-2 language model package `fair-esm` is a core dependency for both backends):
 ```
-pip install mlx==0.28.0
-pip install git+https://github.com/facebookresearch/esm.git
+pip install -e ".[mlx]"
 ```
+Training, data-processing, evaluation and notebook dependencies are optional extras: `pip install -e ".[train,data,eval,notebook]"`.
+
+### Apple silicon notes
+
+- **PyTorch backend on the GPU.** With `--backend torch` the model runs on Metal (MPS) automatically when CUDA is not available. Use `--device cpu` to force the previous CPU behaviour. The random noise is always drawn on the CPU generator, so a given `--seed` produces the same noise on `cpu`, `mps` and `cuda`; coordinates then differ between devices only by floating-point rounding (a few 1e-4 Å after 500 steps in our tests). The MLX and PyTorch backends use different random generators, so for the same seed they produce different, equally valid conformers.
+- **MLX precision.** MLX 0.30 and later run fp32 matrix multiplications in reduced-precision TF32 on M5-class GPUs by default (about 1000x larger rounding error per matmul; a 500-step prediction moved by up to 0.14 Å in our test). SimpleFold sets `MLX_ENABLE_TF32=0` when the package is imported so that the MLX backend keeps exact fp32 numerics (identical to mlx 0.28 up to rounding). The setting is read by MLX at its first matmul, so import `simplefold` before running any other MLX computation in the same process. If you explicitly want the faster reduced-precision mode, export `MLX_ENABLE_TF32=1` before running.
+- **Reproducibility.** `--seed` now also seeds the MLX random generator, so MLX predictions are reproducible run to run (`InferenceWrapper(..., seed=42)` does the same in the notebook API).
 
 ## Example 
 
@@ -53,7 +59,9 @@ simplefold \
     --plddt \                           # output pLDDT
     --fasta_path [FASTA_PATH] \         # path to the target fasta directory or file
     --output_dir [OUTPUT_DIR] \         # path to the output directory
-    --backend [mlx, torch]              # choose from MLX and PyTorch for inference backend 
+    --backend [mlx, torch] \            # choose from MLX and PyTorch for inference backend 
+    --device [auto, cpu, mps, cuda] \   # device for the torch backend (default auto = cuda > mps > cpu)
+    --seed 42                           # random seed (seeds torch, numpy, python and, for --backend mlx, MLX)
 ```
 
 ## Evaluation

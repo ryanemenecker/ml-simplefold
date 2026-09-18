@@ -4,6 +4,7 @@
 #
 
 import os
+import numpy as np
 import torch
 import hydra
 import omegaconf
@@ -20,17 +21,19 @@ from utils.boltz_utils import process_structure, save_structure
 from utils.fasta_utils import process_fastas, download_fasta_utilities
 from boltz_data_pipeline.feature.featurizer import BoltzFeaturizer
 from boltz_data_pipeline.tokenize.boltz_protein import BoltzTokenizer
+from utils.device_utils import get_torch_device  # also pins MLX to exact fp32 (MLX_ENABLE_TF32=0)
+from utils.io_utils import get_config_path, download_file
 
 try: 
     import mlx.core as mx
     from mlx.utils import tree_unflatten, tree_flatten
     from model.mlx.sampler import EMSampler as EMSamplerMLX
     from model.mlx.esm_network import ESM2 as ESM2MLX
-    from utils.mlx_utils import map_torch_to_mlx, map_plddt_torch_to_mlx
+    from utils.mlx_utils import map_torch_to_mlx, map_plddt_torch_to_mlx, load_mlx_state_dict
     MLX_AVAILABLE = True
-except:
+except Exception as e:  # noqa: BLE001 - report why, instead of silently falling back to torch
     MLX_AVAILABLE = False
-    print("MLX not installed, skip importing MLX related packages.")
+    print(f"MLX not installed, skip importing MLX related packages. ({type(e).__name__}: {e})")
 
 
 ckpt_url_dict = {
@@ -54,8 +57,10 @@ class ModelWrapper:
         plddt=False,
         ckpt_dir="./artifacts",
         backend="torch",
+        device="auto",
     ):
         self.simplefold_model = simplefold_model
+        self.device_preference = device
         self.plddt = plddt
         self.ckpt_dir = Path(ckpt_dir)
         self.backend = backend
@@ -70,7 +75,7 @@ class ModelWrapper:
 
     def get_device(self):
         if self.backend == "torch":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = get_torch_device(self.device_preference)
         elif self.backend == "mlx":
             device = "cpu"
         return device
@@ -82,13 +87,13 @@ class ModelWrapper:
         # create folding model
         ckpt_path = os.path.join(self.ckpt_dir, f"{simplefold_model}.ckpt")
         if not os.path.exists(ckpt_path):
-            os.system(f"curl -L -o {ckpt_path} {ckpt_url_dict[simplefold_model]}")
+            download_file(ckpt_url_dict[simplefold_model], ckpt_path)
 
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
         # load model checkpoint
-        cfg_path = os.path.join(
-            "configs/model/architecture", f"foldingdit_{simplefold_model[11:]}.yaml"
+        cfg_path = get_config_path(
+            f"configs/model/architecture/foldingdit_{simplefold_model[11:]}.yaml"
         )
         if self.backend == "torch":
             model_config = omegaconf.OmegaConf.load(cfg_path)
@@ -108,7 +113,7 @@ class ModelWrapper:
                 for k, v in starmap(map_torch_to_mlx, checkpoint.items())
                 if k is not None
             }
-            model.update(tree_unflatten(list(mlx_state_dict.items())))
+            load_mlx_state_dict(model, mlx_state_dict)
         print(f"Folding model {simplefold_model} loaded with {self.backend} backend.")
 
         model.eval()
@@ -124,11 +129,11 @@ class ModelWrapper:
         # load pLDDT module if specified
         plddt_ckpt_path = os.path.join(self.ckpt_dir, "plddt.ckpt")
         if not os.path.exists(plddt_ckpt_path):
-            os.system(f"curl -L -o {plddt_ckpt_path} {plddt_ckpt_url}")
+            download_file(plddt_ckpt_url, plddt_ckpt_path)
 
-        plddt_module_path = "configs/model/architecture/plddt_module.yaml"
+        plddt_module_path = get_config_path("configs/model/architecture/plddt_module.yaml")
         plddt_checkpoint = torch.load(
-            plddt_ckpt_path, map_location="cpu", weights_only=False
+            plddt_ckpt_path, map_location="cpu", weights_only=True
         )
 
         if self.backend == "torch":
@@ -150,7 +155,7 @@ class ModelWrapper:
                 for k, v in starmap(map_plddt_torch_to_mlx, plddt_checkpoint.items())
                 if k is not None
             }
-            plddt_out_module.update(tree_unflatten(list(mlx_state_dict.items())))
+            load_mlx_state_dict(plddt_out_module, mlx_state_dict)
 
         plddt_out_module.eval()
         print(f"pLDDT output module loaded with {self.backend} backend.")
@@ -158,13 +163,11 @@ class ModelWrapper:
         plddt_latent_ckpt_path = os.path.join(self.ckpt_dir, "simplefold_1.6B.ckpt")
         if not os.path.exists(plddt_latent_ckpt_path):
             os.makedirs(self.ckpt_dir, exist_ok=True)
-            os.system(
-                f"curl -L -o {plddt_latent_ckpt_path} {ckpt_url_dict['simplefold_1.6B']}"
-            )
+            download_file(ckpt_url_dict["simplefold_1.6B"], plddt_latent_ckpt_path)
 
-        plddt_latent_config_path = "configs/model/architecture/foldingdit_1.6B.yaml"
+        plddt_latent_config_path = get_config_path("configs/model/architecture/foldingdit_1.6B.yaml")
         plddt_latent_checkpoint = torch.load(
-            plddt_latent_ckpt_path, map_location="cpu", weights_only=False
+            plddt_latent_ckpt_path, map_location="cpu", weights_only=True
         )
 
         if self.backend == "torch":
@@ -185,7 +188,7 @@ class ModelWrapper:
                 for k, v in starmap(map_torch_to_mlx, plddt_latent_checkpoint.items())
                 if k is not None
             }
-            plddt_latent_module.update(tree_unflatten(list(mlx_state_dict.items())))
+            load_mlx_state_dict(plddt_latent_module, mlx_state_dict)
 
         plddt_latent_module.eval()
         print(f"pLDDT latent module loaded with {self.backend} backend.")
@@ -206,8 +209,10 @@ class InferenceWrapper:
         tau,
         device,
         backend,
+        seed=None,
     ):
         self.num_steps = num_steps
+        self.seed = seed
         self.nsample_per_protein = nsample_per_protein
         self.tau = tau
         self.device = device
@@ -216,6 +221,9 @@ class InferenceWrapper:
         if self.backend == "mlx" and not MLX_AVAILABLE:
             self.backend = "torch"
             print("MLX not installed, switch to torch backend.")
+        if self.seed is not None and self.backend == "mlx":
+            # pl.seed_everything (used in the notebook) does not seed MLX
+            mx.random.seed(self.seed)
 
         # create output directory
         output_dir = Path(output_dir)
@@ -253,7 +261,7 @@ class InferenceWrapper:
                 for k, v in starmap(map_torch_to_mlx, esm_state_dict_torch.items())
                 if k is not None
             }
-            esm_model_mlx.update(tree_unflatten(list(esm_state_dict_torch.items())))
+            load_mlx_state_dict(esm_model_mlx, esm_state_dict_torch)
             esm_model = esm_model_mlx
         print(f"pLM ESM-3B loaded with {self.backend} backend.")
 
@@ -321,7 +329,8 @@ class InferenceWrapper:
     def run_inference(self, batch, model, plddt_model, device):
         # run inference for target protein
         if self.backend == "torch":
-            noise = torch.randn_like(batch["coords"]).to(device)
+            # draw on the CPU generator so a given seed yields the same noise on cpu/mps/cuda
+            noise = torch.randn(batch["coords"].shape, dtype=batch["coords"].dtype).to(device)
         elif self.backend == "mlx":
             noise = mx.random.normal(batch["coords"].shape)
         out_dict = self.sampler.sample(model, self.flow, noise, batch)
@@ -352,6 +361,8 @@ class InferenceWrapper:
                 )
             # scale pLDDT to [0, 100]
             plddts = plddt_out_dict["plddt"] * 100.0
+            if self.backend == "torch":
+                plddts = plddts.detach().cpu()
 
         out_dict = self.processor.postprocess(out_dict, batch)
         # sampled_coord = out_dict['denoised_coords'].detach()
@@ -370,6 +381,9 @@ class InferenceWrapper:
         sampled_coord = results["sampled_coord"]
         pad_mask = results["pad_mask"]
         plddt = results["plddts"]
+        if plddt is not None and self.backend == "mlx":
+            # materialize once instead of one lazy slice eval per residue in the writers
+            plddt = np.array(plddt)
 
         save_paths = []
         for i in range(sampled_coord.shape[0]):

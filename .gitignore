@@ -2,3 +2,5 @@
 *.DS_Store
 *.egg-info
 artifacts/
+build/
+dist/

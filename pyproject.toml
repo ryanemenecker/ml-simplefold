@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,41 +13,56 @@ authors = [
     { name = "Yuyang Wang", email = "yuyangw@apple.com" },
     { name = "Miguel Angel Bautista Martin", email = "mbautistamartin@apple.com" }
 ]
+# Inference core: everything imported by `simplefold`, inference.py and wrapper.py.
+# Lower bounds are conservative floors. Outputs were verified with the reference environment
+# (torch 2.14, lightning 2.5.2, numpy 2.2.6, einops 0.8.1/0.8.2, biopython 1.85, rdkit 2025.3.5,
+# ihm 2.7, modelcif 1.4, mashumaro 3.16, dm-tree 0.1.9/0.1.10, click 8.2/8.5, fair-esm 2.0.0/2.0.1).
 dependencies = [
-    "lightning==2.5.2",
-    "biopython==1.85",
-    "hydra-colorlog==1.2.0",
-    "mediapy==1.0.2",
-    "ipykernel==6.22.0",
-    "ipyvtklink==0.2.3",
-    "gemmi==0.7.3",
-    "biotite==1.2.0",
-    "rdkit==2025.3.5",
-    "gemmi==0.7.3",
-    "p-tqdm==1.4.2",
-    "einops==0.8.1",
-    "mashumaro==3.16",
-    "ihm==2.7",
-    "modelcif==1.4",
-    "dm-tree==0.1.9",
-    "click==8.2.1",
-    "timm==1.0.19",
-    "py3Dmol==2.5.2",
-    "scikit-learn==1.7.1",
-    "pandas==2.3.1",
-    "seaborn==0.13.2",
+    "torch>=2.6",
+    "lightning>=2.5.2,<3",
+    "pytorch-lightning>=2.5.2,<3",  # lightning's own unversioned dependency; keep the pair together
+    "hydra-core>=1.3,<2",
+    "omegaconf>=2.3,<3",
+    "numpy>=1.26",
+    "einops>=0.8.0",
+    "biopython>=1.83",
+    "rdkit>=2025.3.5,<2026",  # ccd.pkl holds pickled RDKit molecules; stay within the verified major
+    "mashumaro>=3.13",
+    "ihm>=2.7",
+    "modelcif>=1.4",
+    "dm-tree>=0.1.8",
+    "click>=8.1",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+    "fair-esm>=2.0.0",  # ESM-2 language model (both backends)
 ]
+
+[project.optional-dependencies]
+# MLX backend on Apple silicon. Note: mlx >= 0.30 uses TF32 matmuls on M5-class GPUs by default;
+# SimpleFold pins exact fp32 via MLX_ENABLE_TF32=0 at import (see utils/device_utils.py).
+mlx = ["mlx>=0.32.2"]
+# train.py / train_fsdp.py / test.py
+train = [
+    "fairscale>=0.4.13",
+    "hydra-colorlog>=1.2",
+    "rich>=13",
+    "lightning-utilities>=0.10",
+    "tensorboard>=2.15",
+    "scipy>=1.11",
+]
+# process_mmcif.py / process_structure.py
+data = ["redis>=5", "p-tqdm>=1.4", "gemmi>=0.6.5", "scikit-learn>=1.3", "scipy>=1.11"]
+# evaluation/*
+eval = ["pandas>=2.0", "scipy>=1.11", "seaborn>=0.13", "matplotlib>=3.8", "pillow>=10"]
+# sample.ipynb
+notebook = ["py3Dmol>=2.0", "ipykernel>=6.29"]
 
 [project.urls]
 Homepage = "https://github.com/apple/ml-simplefold"
 
-# Optional: create a CLI command `simplefold` that calls simplefold/cli.py:main()
+# Create a CLI command `simplefold` that calls simplefold/cli.py:main()
 [project.scripts]
 simplefold = "simplefold.cli:main"
-
-# Tell hatchling where your packages live when using src layout:
-[tool.hatch.build.targets.wheel]
-packages = ["src/simplefold"]
 
 # Tell setuptools to include YAML files from configs
 [tool.setuptools.packages.find]

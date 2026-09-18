@@ -13,7 +13,6 @@ from copy import deepcopy
 from pathlib import Path
 from itertools import starmap
 import lightning.pytorch as pl
-from importlib import resources
 
 from model.flow import LinearPath
 from model.torch.sampler import EMSampler
@@ -25,17 +24,19 @@ from utils.boltz_utils import process_structure, save_structure
 from utils.fasta_utils import process_fastas, download_fasta_utilities, check_fasta_inputs
 from boltz_data_pipeline.feature.featurizer import BoltzFeaturizer
 from boltz_data_pipeline.tokenize.boltz_protein import BoltzTokenizer
+from utils.device_utils import get_torch_device  # also pins MLX to exact fp32 (MLX_ENABLE_TF32=0)
+from utils.io_utils import get_config_path, download_file
 
 try: 
     import mlx.core as mx
     from mlx.utils import tree_unflatten, tree_flatten
     from model.mlx.sampler import EMSampler as EMSamplerMLX
     from model.mlx.esm_network import ESM2 as ESM2MLX
-    from utils.mlx_utils import map_torch_to_mlx, map_plddt_torch_to_mlx
+    from utils.mlx_utils import map_torch_to_mlx, map_plddt_torch_to_mlx, load_mlx_state_dict
     MLX_AVAILABLE = True
-except:
+except Exception as e:  # noqa: BLE001 - report why, instead of silently falling back to torch
     MLX_AVAILABLE = False
-    print("MLX not installed, skip importing MLX related packages.")
+    print(f"MLX not installed, skip importing MLX related packages. ({type(e).__name__}: {e})")
 
 
 ckpt_url_dict = {
@@ -50,30 +51,6 @@ ckpt_url_dict = {
 plddt_ckpt_url = "https://ml-site.cdn-apple.com/models/simplefold/plddt_module_1.6B.ckpt"
 
 
-def get_config_path(relative_path):
-    """Get the absolute path to a config file using importlib.resources."""
-    try:
-        # Remove 'configs/' prefix if present since we access configs directly as a subpackage
-        config_subpath = relative_path.replace('configs/', '')
-
-        # Access configs as a subpackage resource
-        config_files = resources.files('simplefold.configs')
-        config_path = config_files / config_subpath
-
-        if config_path.is_file():
-            return str(config_path)
-
-    except Exception as e:
-        pass
-
-    # If importlib.resources fails, raise an informative error
-    raise FileNotFoundError(
-        f"Could not find config file: {relative_path}. "
-        f"Expected to find it in the simplefold.configs package."
-    )
-
-
-
 def initialize_folding_model(args):
     # define folding model
     simplefold_model = args.simplefold_model
@@ -86,14 +63,14 @@ def initialize_folding_model(args):
     ckpt_path = os.path.join(ckpt_dir, f"{simplefold_model}.ckpt")
     if not os.path.exists(ckpt_path):
         os.makedirs(ckpt_dir, exist_ok=True)
-        os.system(f"curl -L {ckpt_url_dict[simplefold_model]} -o {ckpt_path}")
+        download_file(ckpt_url_dict[simplefold_model], ckpt_path)
     cfg_path = get_config_path(f"configs/model/architecture/foldingdit_{simplefold_model[11:]}.yaml")
 
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
     # load model checkpoint
     if args.backend == 'torch':
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_torch_device(getattr(args, "device", "auto"))
         model_config = omegaconf.OmegaConf.load(cfg_path)
         model = hydra.utils.instantiate(model_config)
         model.load_state_dict(checkpoint, strict=True)
@@ -108,7 +85,7 @@ def initialize_folding_model(args):
         model_config = omegaconf.OmegaConf.create(yaml_str)
         model = hydra.utils.instantiate(model_config)
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, checkpoint.items()) if k is not None}
-        model.update(tree_unflatten(list(mlx_state_dict.items())))
+        load_mlx_state_dict(model, mlx_state_dict)
     print(f"Folding model {simplefold_model} loaded.")
     print(f"Using device: {device}.")
 
@@ -124,10 +101,10 @@ def initialize_plddt_module(args, device):
     plddt_ckpt_path = os.path.join(args.ckpt_dir, "plddt.ckpt")
     if not os.path.exists(plddt_ckpt_path):
         os.makedirs(args.ckpt_dir, exist_ok=True)
-        os.system(f"curl -L {plddt_ckpt_url} -o {plddt_ckpt_path}")
+        download_file(plddt_ckpt_url, plddt_ckpt_path)
 
     plddt_module_path = get_config_path("configs/model/architecture/plddt_module.yaml")
-    plddt_checkpoint = torch.load(plddt_ckpt_path, map_location="cpu", weights_only=False)
+    plddt_checkpoint = torch.load(plddt_ckpt_path, map_location="cpu", weights_only=True)
 
     if args.backend == "torch":
         plddt_config = omegaconf.OmegaConf.load(plddt_module_path)
@@ -144,7 +121,7 @@ def initialize_plddt_module(args, device):
         plddt_out_module = hydra.utils.instantiate(plddt_config)
 
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_plddt_torch_to_mlx, plddt_checkpoint.items()) if k is not None}
-        plddt_out_module.update(tree_unflatten(list(mlx_state_dict.items())))
+        load_mlx_state_dict(plddt_out_module, mlx_state_dict)
 
     plddt_out_module.eval()
     print(f"pLDDT output module loaded with {args.backend} backend.")
@@ -152,10 +129,10 @@ def initialize_plddt_module(args, device):
     plddt_latent_ckpt_path = os.path.join(args.ckpt_dir, "simplefold_1.6B.ckpt")
     if not os.path.exists(plddt_latent_ckpt_path):
         os.makedirs(args.ckpt_dir, exist_ok=True)
-        os.system(f"curl -L {ckpt_url_dict['simplefold_1.6B']} -o {plddt_latent_ckpt_path}")
+        download_file(ckpt_url_dict["simplefold_1.6B"], plddt_latent_ckpt_path)
 
     plddt_latent_config_path = get_config_path("configs/model/architecture/foldingdit_1.6B.yaml")
-    plddt_latent_checkpoint = torch.load(plddt_latent_ckpt_path, map_location="cpu", weights_only=False)
+    plddt_latent_checkpoint = torch.load(plddt_latent_ckpt_path, map_location="cpu", weights_only=True)
 
     if args.backend == "torch":
         plddt_latent_config = omegaconf.OmegaConf.load(plddt_latent_config_path)
@@ -171,7 +148,7 @@ def initialize_plddt_module(args, device):
         plddt_latent_config = omegaconf.OmegaConf.create(yaml_str)
         plddt_latent_module = hydra.utils.instantiate(plddt_latent_config)
         mlx_state_dict = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, plddt_latent_checkpoint.items()) if k is not None}
-        plddt_latent_module.update(tree_unflatten(list(mlx_state_dict.items())))
+        load_mlx_state_dict(plddt_latent_module, mlx_state_dict)
 
     plddt_latent_module.eval()
     print(f"pLDDT latent module loaded with {args.backend} backend.")
@@ -192,7 +169,7 @@ def initialize_esm_model(args, device):
         esm_state_dict_torch = esm_model.cpu().state_dict()
 
         esm_state_dict_torch = {k: mx.array(v) for k, v in starmap(map_torch_to_mlx, esm_state_dict_torch.items()) if k is not None}
-        esm_model_mlx.update(tree_unflatten(list(esm_state_dict_torch.items())))
+        load_mlx_state_dict(esm_model_mlx, esm_state_dict_torch)
         esm_model = esm_model_mlx
     print(f"pLM ESM-3B loaded with {args.backend} backend.")
 
@@ -237,7 +214,8 @@ def generate_structure(
 ):
     # run inference for target protein
     if args.backend == "torch":
-        noise = torch.randn_like(batch['coords']).to(device)
+        # draw on the CPU generator so a given seed yields the same noise on cpu/mps/cuda
+        noise = torch.randn(batch['coords'].shape, dtype=batch['coords'].dtype).to(device)
     elif args.backend == "mlx":
         noise = mx.random.normal(batch['coords'].shape)
     out_dict = sampler.sample(model, flow, noise, batch)
@@ -263,6 +241,12 @@ def generate_structure(
             )
         # scale pLDDT to [0, 100]
         plddts = plddt_out_dict["plddt"] * 100.0
+        if args.backend == "torch":
+            # the writers call .item() per residue; one transfer instead of one sync per residue
+            plddts = plddts.detach().cpu()
+        else:
+            # same for MLX: materialize once instead of one lazy slice eval per residue
+            plddts = np.array(plddts)
     else:
         plddts = None
 
@@ -300,6 +284,11 @@ def predict_structures_from_fastas(args):
 
     # initialize other components
     tokenizer, featurizer, processor, flow, sampler = initialize_others(args, device)
+
+    if args.backend == "mlx":
+        # pl.seed_everything seeds python/numpy/torch only; MLX has its own generator. Seed it after all
+        # models are built so the seed -> noise mapping does not depend on which models were loaded.
+        mx.random.seed(args.seed)
 
     # process fasta files to input format
     download_fasta_utilities(cache)

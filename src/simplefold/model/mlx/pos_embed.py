@@ -6,9 +6,6 @@
 import mlx.core as mx
 import mlx.nn as nn
 import math
-from einops.array_api import rearrange
-import torch
-import numpy as np
 
 
 class AbsolutePositionEncoding(nn.Module):
@@ -190,15 +187,21 @@ class AxialRotaryPositionEncoding(nn.Module):
         self.embed_dim = embed_dim // num_heads
         self.base = base
 
-    def __call__(self, xq, xk, pos):
+    def compute_freqs_cis(self, pos):
+        """RoPE table for ``pos`` [B, N, in_dim]. It depends only on ``pos``, so callers that apply
+        the same positions many times (every sampling step, every block of a trunk) may cache it."""
+        if pos.ndim == 2:
+            pos = pos[..., None]
+        freqs_cis = compute_axial_cis(pos, self.in_dim, self.embed_dim, self.base)
+        return mx.expand_dims(freqs_cis, axis=1)
+
+    def __call__(self, xq, xk, pos, freqs_cis=None):
         """
         xq: [B, H, N, D]
         xk: [B, H, N, D]
         pos: [B, N, in_dim]
+        freqs_cis: optional precomputed output of compute_freqs_cis(pos)
         """
-        if pos.ndim == 2:
-            pos = pos[..., None]
-        freqs_cis = compute_axial_cis(pos, self.in_dim, self.embed_dim, self.base)
-        freqs_cis = mx.expand_dims(freqs_cis, axis=1)
-
+        if freqs_cis is None:
+            freqs_cis = self.compute_freqs_cis(pos)
         return apply_rotary_emb(xq, xk, freqs_cis)

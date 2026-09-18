@@ -2,5 +2,3 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (c) 2025 Apple Inc. Licensed under MIT License.
 #
-
-import utils.device_utils  # noqa: F401  (pins MLX to exact fp32: MLX_ENABLE_TF32=0)

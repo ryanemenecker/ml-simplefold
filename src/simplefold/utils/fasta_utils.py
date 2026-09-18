@@ -9,18 +9,15 @@
 import click
 import pickle
 import json
-import urllib.request
 from pathlib import Path
 from tqdm import tqdm
 from dataclasses import asdict
 
 from boltz_data_pipeline.types import Manifest, Record
+from utils.io_utils import download_file
 
 
 CCD_URL = "https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl"
-MODEL_URL = (
-    "https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt"
-)
 
 
 from collections.abc import Mapping
@@ -114,7 +111,9 @@ def check_fasta_inputs(data: Path) -> list[Path]:
 
 
 def download_fasta_utilities(cache: Path) -> None:
-    """Download all the required data.
+    """Download the CCD component dictionary needed to parse FASTA inputs.
+
+    (The Boltz-1 confidence checkpoint that used to be fetched here was never read by SimpleFold.)
 
     Parameters
     ----------
@@ -129,16 +128,7 @@ def download_fasta_utilities(cache: Path) -> None:
             f"Downloading the CCD dictionary to {ccd}. You may "
             "change the cache directory with the --cache flag."
         )
-        urllib.request.urlretrieve(CCD_URL, str(ccd))
-
-    # Download model
-    model = cache / "boltz1_conf.ckpt"
-    if not model.exists():
-        click.echo(
-            f"Downloading the model weights to {model}. You may "
-            "change the cache directory with the --cache flag."
-        )
-        urllib.request.urlretrieve(MODEL_URL, str(model))
+        download_file(CCD_URL, ccd)
 
 
 def process_fastas(

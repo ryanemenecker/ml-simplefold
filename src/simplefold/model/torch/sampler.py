@@ -37,10 +37,12 @@ class EMSampler():
                 self.t_start, 1.0, steps=self.num_timesteps + 1
             )
 
-    def diffusion_coefficient(self, t, eps=0.01):
+    def diffusion_coefficient(self, t, eps=0.01, w_is_zero=None):
         # determine diffusion coefficient
         w = (1.0 - t) / (t + eps)
-        if t >= self.w_cutoff:
+        if w_is_zero is None:
+            w_is_zero = t >= self.w_cutoff
+        if w_is_zero:
             w = 0.0
         return w
 
@@ -53,9 +55,12 @@ class EMSampler():
         t, 
         t_next, 
         batch, 
+        static=None,
+        w_is_zero=None,
     ):
         dt = t_next - t
-        eps = torch.randn_like(y).to(y)
+        # draw on the CPU generator so a given seed yields the same noise on cpu/mps/cuda
+        eps = torch.randn(y.shape, dtype=y.dtype).to(y.device)
 
         y = center_random_augmentation(
             y,
@@ -65,14 +70,13 @@ class EMSampler():
         )
 
         batched_t = repeat(t, " -> b", b=y.shape[0])
-        velocity = model_fn(
-            noised_pos=y,
-            t=batched_t,
-            feats=batch,
-        )['predict_velocity']
+        model_kwargs = dict(noised_pos=y, t=batched_t, feats=batch)
+        if static is not None:
+            model_kwargs["static"] = static
+        velocity = model_fn(**model_kwargs)['predict_velocity']
         score = flow.compute_score_from_velocity(velocity, y, t)
 
-        diff_coeff = self.diffusion_coefficient(t)
+        diff_coeff = self.diffusion_coefficient(t, w_is_zero=w_is_zero)
         drift = velocity + diff_coeff * score
         mean_y = y + drift * dt
         y_sample = mean_y + torch.sqrt(2.0 * dt * diff_coeff * self.tau) * eps
@@ -85,6 +89,15 @@ class EMSampler():
         steps = self.steps.to(noise.device)
         y_sampled = noise
         feats = batch
+
+        # Everything in the model that depends only on `feats` is constant across the steps of one
+        # protein: compute it once (same ops, same inputs -> bitwise identical results).
+        # `model_fn` is either the model or a bound `forward` (e.g. model_ema.module.forward)
+        owner = getattr(model_fn, "__self__", model_fn)
+        precompute_static = getattr(owner, "precompute_static", None)
+        static = precompute_static(feats) if precompute_static is not None else None
+        # Evaluate the w_cutoff branch for all steps at once (one host sync instead of one per step).
+        w_is_zero = (steps >= self.w_cutoff).tolist()
 
         for i in tqdm(
             range(sampling_timesteps),
@@ -101,6 +114,8 @@ class EMSampler():
                 t,
                 t_next,
                 feats,
+                static=static,
+                w_is_zero=w_is_zero[i],
             )
 
         return {

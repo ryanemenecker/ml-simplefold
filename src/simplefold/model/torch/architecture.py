@@ -169,32 +169,48 @@ class FoldingDiT(nn.Module):
 
         return atom_attn_mask
 
-    def forward(self, noised_pos, t, feats, self_cond=None):
+    @staticmethod
+    def _trunk_freqs_cis(trunk, pos):
+        """Axial RoPE table shared by all blocks of a HomogenTrunk (None if the trunk has no RoPE)."""
+        try:
+            pos_embedder = trunk.blocks[0].attn.pos_embedder
+        except (AttributeError, IndexError):
+            return None
+        if pos_embedder is None or not hasattr(pos_embedder, "compute_freqs_cis"):
+            return None
+        return pos_embedder.compute_freqs_cis(pos)
+
+    def precompute_static(self, feats):
+        """Compute everything in forward() that depends only on ``feats``.
+
+        These tensors are identical on every sampling step of one protein, so the sampler computes
+        them once and hands them back through ``forward(..., static=...)``. The exact same ops run
+        on the exact same inputs as the inline path, so results are bitwise identical.
+        """
         B, N, _ = feats["ref_pos"].shape
-        M = feats["mol_type"].shape[1]
         atom_to_token = feats["atom_to_token"].float() # [B, N, M]
         atom_to_token_idx = feats["atom_to_token_idx"]
         ref_space_uid = feats["ref_space_uid"]
+        static = {"_feats_id": id(feats)}  # guards against reuse with a different feats dict
 
         # create atom attention masks
-        atom_attn_mask_enc = self.create_atom_attn_mask(
+        static["atom_attn_mask_enc"] = self.create_atom_attn_mask(
             feats, 
             natoms=N,
             atom_n_queries=self.atom_n_queries_enc,
             atom_n_keys=self.atom_n_keys_enc,
         )
-        atom_attn_mask_dec = self.create_atom_attn_mask(
+        static["atom_attn_mask_dec"] = self.create_atom_attn_mask(
             feats,
             natoms=N,
             atom_n_queries=self.atom_n_queries_dec,
             atom_n_keys=self.atom_n_keys_dec,
         )
 
-        # create condition embeddings for AdaLN
-        c_emb = self.time_embedder(t)  # (B, D)
+        # length condition for AdaLN
         if self.use_length_condition:
             length = feats["max_num_tokens"].float().unsqueeze(-1)
-            c_emb = c_emb + self.length_embedder(torch.log(length))
+            static["length_emb"] = self.length_embedder(torch.log(length))
 
         # create atom features
         mol_type = feats["mol_type"]
@@ -221,23 +237,17 @@ class FoldingDiT(nn.Module):
             ],
             dim=-1,
         )                                                           # (B, N, PD1+PD2+427)
-        atom_feat = self.atom_feat_proj(atom_feat)                  # (B, N, D)
-
-        atom_coord = self.pos_embedder(pos=noised_pos)              # (B, N, PD1)
-        atom_coord = self.atom_pos_proj(atom_coord)                 # (B, N, D)
-
-        atom_in = torch.cat([atom_feat, atom_coord], dim=-1)
-        atom_in = self.atom_in_proj(atom_in)                        # (B, N, D)
+        static["atom_feat"] = self.atom_feat_proj(atom_feat)        # (B, N, D)
 
         # position embeddings for Axial RoPE
-        atom_pe_pos = torch.cat(
+        static["atom_pe_pos"] = torch.cat(
             [
                 ref_space_uid.unsqueeze(-1).float(),                 # (B, N, 1)
                 feats["ref_pos"],                                    # (B, N, 3)
             ],
             dim=-1,
         )                                                            # (B, N, 4)
-        token_pe_pos = torch.cat(
+        static["token_pe_pos"] = torch.cat(
             [
                 feats["residue_index"].unsqueeze(-1).float(),        # (B, M, 1)
                 feats["entity_id"].unsqueeze(-1).float(),            # (B, M, 1)
@@ -246,6 +256,49 @@ class FoldingDiT(nn.Module):
             ],
             dim=-1,
         )                                                            # (B, M, 4)
+        # RoPE tables: one per trunk instead of one per block per step
+        static["freqs_cis_enc"] = self._trunk_freqs_cis(self.atom_encoder_transformer, static["atom_pe_pos"])
+        static["freqs_cis_dec"] = self._trunk_freqs_cis(self.atom_decoder_transformer, static["atom_pe_pos"])
+        static["freqs_cis_trunk"] = self._trunk_freqs_cis(self.trunk, static["token_pe_pos"])
+
+        # grouping / ungrouping operators
+        static["atom_to_token"] = atom_to_token
+        atom_to_token_mean = atom_to_token / (
+            atom_to_token.sum(dim=1, keepdim=True) + 1e-6
+        )
+        static["atom_to_token_mean_T"] = atom_to_token_mean.transpose(1, 2)
+
+        # ESM embedding
+        static["esm_s"] = (self.esm_s_combine.softmax(0).unsqueeze(0) @ feats['esm_s']).squeeze(2)
+        force_drop_ids = feats.get("force_drop_ids", None)
+        if self.training or force_drop_ids is not None:
+            # condition dropout is redrawn on every forward: keep it in the dynamic path
+            static["esm_emb"] = None
+        else:
+            static["esm_emb"] = self.esm_s_proj(static["esm_s"], False, None)
+        return static
+
+    def forward(self, noised_pos, t, feats, self_cond=None, static=None):
+        if static is None:
+            static = self.precompute_static(feats)
+        elif static.get("_feats_id") != id(feats):
+            raise ValueError(
+                "`static` was precomputed for a different `feats` dict; call precompute_static(feats) again."
+            )
+        N = noised_pos.shape[1]
+        M = feats["mol_type"].shape[1]
+        atom_to_token = static["atom_to_token"]                     # [B, N, M]
+
+        # create condition embeddings for AdaLN
+        c_emb = self.time_embedder(t)  # (B, D)
+        if self.use_length_condition:
+            c_emb = c_emb + static["length_emb"]
+
+        atom_coord = self.pos_embedder(pos=noised_pos)              # (B, N, PD1)
+        atom_coord = self.atom_pos_proj(atom_coord)                 # (B, N, D)
+
+        atom_in = torch.cat([static["atom_feat"], atom_coord], dim=-1)
+        atom_in = self.atom_in_proj(atom_in)                        # (B, N, D)
 
         # atom encoder
         atom_c_emb_enc = self.atom_enc_cond_proj(c_emb)
@@ -253,21 +306,21 @@ class FoldingDiT(nn.Module):
         atom_latent = self.atom_encoder_transformer(
             latents=atom_latent, 
             c=atom_c_emb_enc, 
-            attention_mask=atom_attn_mask_enc,
-            pos=atom_pe_pos,
+            attention_mask=static["atom_attn_mask_enc"],
+            pos=static["atom_pe_pos"],
+            freqs_cis=static["freqs_cis_enc"],
         )
         atom_latent = self.atom2latent_proj(atom_latent)
 
         # grouping: aggregate atom tokens to residue tokens
-        atom_to_token_mean = atom_to_token / (
-            atom_to_token.sum(dim=1, keepdim=True) + 1e-6
-        )
-        latent = torch.bmm(atom_to_token_mean.transpose(1, 2), atom_latent)
+        latent = torch.bmm(static["atom_to_token_mean_T"], atom_latent)
         assert latent.shape[1] == M
 
-        esm_s = (self.esm_s_combine.softmax(0).unsqueeze(0) @ feats['esm_s']).squeeze(2)
-        force_drop_ids = feats.get("force_drop_ids", None)
-        esm_emb = self.esm_s_proj(esm_s, self.training, force_drop_ids)
+        esm_emb = static["esm_emb"]
+        if esm_emb is None:
+            force_drop_ids = feats.get("force_drop_ids", None)
+            # token_drop writes in place: give it a copy so the reusable static tensor is untouched
+            esm_emb = self.esm_s_proj(static["esm_s"].clone(), self.training, force_drop_ids)
         assert esm_emb.shape[1] == latent.shape[1]
 
         latent = self.esm_cat_proj(torch.cat([latent, esm_emb], dim=-1))
@@ -277,7 +330,8 @@ class FoldingDiT(nn.Module):
             latents=latent, 
             c=c_emb, 
             attention_mask=None,
-            pos=token_pe_pos,
+            pos=static["token_pe_pos"],
+            freqs_cis=static["freqs_cis_trunk"],
         )
 
         # ungrouping: broadcast residue tokens to atom tokens
@@ -293,8 +347,9 @@ class FoldingDiT(nn.Module):
         output = self.atom_decoder_transformer(
             latents=output, 
             c=atom_c_emb_dec,
-            attention_mask=atom_attn_mask_dec,
-            pos=atom_pe_pos,
+            attention_mask=static["atom_attn_mask_dec"],
+            pos=static["atom_pe_pos"],
+            freqs_cis=static["freqs_cis_dec"],
         )
         output = self.final_layer(output, c=c_emb)
 

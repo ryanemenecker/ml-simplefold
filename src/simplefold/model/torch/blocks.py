@@ -5,8 +5,7 @@
 
 import torch
 from torch import nn
-from timm.models.vision_transformer import Mlp
-from model.torch.layers import modulate, SwiGLUFeedForward
+from model.torch.layers import modulate, SwiGLUFeedForward, Mlp
 
 
 class DiTBlock(nn.Module):

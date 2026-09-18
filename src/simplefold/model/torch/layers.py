@@ -63,7 +63,11 @@ class SelfAttentionLayer(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.pos_embedder and pos is not None:
-            q, k = self.pos_embedder(q, k, pos)
+            freqs_cis = kwargs.get("freqs_cis")  # precomputed RoPE table (per-protein constant)
+            if freqs_cis is not None:
+                q, k = self.pos_embedder(q, k, pos, freqs_cis=freqs_cis)
+            else:
+                q, k = self.pos_embedder(q, k, pos)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -98,7 +102,11 @@ class EfficientSelfAttentionLayer(SelfAttentionLayer):
             attn_mask = attn_mask.to(dtype=q.dtype)
 
         if self.pos_embedder and pos is not None:
-            q, k = self.pos_embedder(q, k, pos)
+            freqs_cis = kwargs.get("freqs_cis")  # precomputed RoPE table (per-protein constant)
+            if freqs_cis is not None:
+                q, k = self.pos_embedder(q, k, pos, freqs_cis=freqs_cis)
+            else:
+                q, k = self.pos_embedder(q, k, pos)
 
         q, k = self.q_norm(q), self.k_norm(k)
         x = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
@@ -113,6 +121,47 @@ class EfficientSelfAttentionLayer(SelfAttentionLayer):
 #################################################################################
 #                              FeedForward Layer                                #
 #################################################################################
+
+
+class Mlp(nn.Module):
+    """MLP block as used in Vision Transformers (vendored from ``timm.layers.Mlp``).
+
+    Vendored so the package does not depend on timm/torchvision. Attribute names, construction
+    order and forward order match timm exactly, so checkpoints and seeded initialization are
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        act_layer=nn.GELU,
+        norm_layer=None,
+        bias=True,
+        drop=0.0,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        bias = tuple(bias) if isinstance(bias, (tuple, list)) else (bias, bias)
+        drop_probs = tuple(drop) if isinstance(drop, (tuple, list)) else (drop, drop)
+
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0])
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.norm(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
 
 
 class SwiGLUFeedForward(nn.Module):

@@ -16,6 +16,15 @@ class AbsolutePositionEncoding(nn.Module):
         self.include_input = include_input
         assert embed_dim % in_dim == 0, "embed_dim must be divisible by in_dim"
         self.embed_dim = embed_dim + in_dim if include_input else embed_dim
+        # Frequency table built once on the CPU in fp32. Values are identical to the previous per-call
+        # computation on CPU; on MPS the per-call 2**linspace differed from CPU by 1 ulp, which the
+        # residue index then amplified. Kept as a plain attribute (not a buffer) so that module dtype
+        # casts (e.g. FSDP bf16 buffer casting in training) cannot touch it, exactly like the original
+        # per-call fp32 computation; it is moved to the input device on use (a few hundred floats).
+        embed_dim_1d = self.hidden_dim // (self.in_dim * 2)
+        omega = 2 ** torch.linspace(0, math.log(224, 2) - 1, embed_dim_1d)
+        omega *= torch.pi
+        self._omega = omega
 
     def forward(self, pos):
         pos_embs = []
@@ -31,9 +40,7 @@ class AbsolutePositionEncoding(nn.Module):
         """
         https://github.com/facebookresearch/DiT/blob/main/models.py#L303
         """
-        embed_dim = self.hidden_dim // (self.in_dim * 2)
-        omega = 2 ** torch.linspace(0, math.log(224, 2) - 1, embed_dim).to(pos.device)
-        omega *= torch.pi
+        omega = self._omega.to(pos.device)
 
         if len(pos.shape) == 1:
             out = torch.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
@@ -164,14 +171,21 @@ class AxialRotaryPositionEncoding(nn.Module):
         self.embed_dim = embed_dim // num_heads
         self.base = base
 
-    def forward(self, xq, xk, pos):
+    def compute_freqs_cis(self, pos):
+        """RoPE table for ``pos`` [B, N, in_dim]. It depends only on ``pos``, so callers that apply
+        the same positions many times (every sampling step, every block of a trunk) may cache it."""
+        if pos.ndim == 2:
+            pos = pos.unsqueeze(-1)
+        freqs_cis = compute_axial_cis(pos, self.in_dim, self.embed_dim, self.base)
+        return freqs_cis.unsqueeze(1)
+
+    def forward(self, xq, xk, pos, freqs_cis=None):
         """
         xq: [B, H, N, D]
         xk: [B, H, N, D]
         pos: [B, N, in_dim]
+        freqs_cis: optional precomputed output of compute_freqs_cis(pos)
         """
-        if pos.ndim == 2:
-            pos = pos.unsqueeze(-1)
-        freqs_cis = compute_axial_cis(pos, self.in_dim, self.embed_dim, self.base)
-        freqs_cis = freqs_cis.unsqueeze(1)
+        if freqs_cis is None:
+            freqs_cis = self.compute_freqs_cis(pos)
         return apply_rotary_emb(xq, xk, freqs_cis.to(xq.device))

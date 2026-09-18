@@ -5,7 +5,6 @@
 
 import os
 import pickle
-import blobfile as bf
 from pathlib import Path
 from typing import Optional
 from dataclasses import asdict
